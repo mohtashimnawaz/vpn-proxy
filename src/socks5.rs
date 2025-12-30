@@ -102,11 +102,7 @@ async fn handle_client(mut socket: TcpStream) -> Result<()> {
             socket.write_all(&resp).await?;
 
             // proxy data both ways
-            let (mut ri, mut wi) = socket.split();
-            let (mut ro, mut wo) = upstream.split();
-
-            // Use copy_bidirectional
-            match tokio::io::copy_bidirectional(&mut ri, &mut wo, &mut ro, &mut wi).await {
+            match tokio::io::copy_bidirectional(&mut socket, &mut upstream).await {
                 Ok((_a, _b)) => {
                     debug!("connection closed");
                 }
@@ -116,8 +112,8 @@ async fn handle_client(mut socket: TcpStream) -> Result<()> {
             }
 
             // Ensure sockets are shutdown cleanly
-            let _ = wi.shutdown().await;
-            let _ = wo.shutdown().await;
+            let _ = socket.shutdown().await;
+            let _ = upstream.shutdown().await;
         }
         Err(e) => {
             warn!(error = %e, %dest, "failed to connect to destination");
