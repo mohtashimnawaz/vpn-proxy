@@ -4,6 +4,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
+#[cfg(feature = "tls")]
+type TlsAcceptorType = tokio_rustls::TlsAcceptor;
+#[cfg(not(feature = "tls"))]
+type TlsAcceptorType = ();
+
 /// Run the SOCKS5 proxy. If `tls` is Some((cert_path, key_path)) the proxy will accept
 /// TLS on the client side (client -> proxy TLS) using rustls. TLS support is feature-gated
 /// behind the `tls` Cargo feature.
@@ -18,6 +23,9 @@ pub async fn run(listen: &str, tls: Option<(String, String)>, auth: Option<(Stri
     } else {
         None
     };
+
+    #[cfg(not(feature = "tls"))]
+    let acceptor = None;
 
     // For normal run, bind and run accept loop
     let listener = TcpListener::bind(listen)
@@ -43,6 +51,9 @@ pub async fn start_background(listen: &str, tls: Option<(String, String)>, auth:
         None
     };
 
+    #[cfg(not(feature = "tls"))]
+    let acceptor = None;
+
     let listener = TcpListener::bind(listen)
         .await
         .with_context(|| format!("failed to bind to {}", listen))?;
@@ -60,7 +71,7 @@ pub async fn start_background(listen: &str, tls: Option<(String, String)>, auth:
 async fn accept_loop(
     listener: TcpListener,
     #[allow(unused_variables)]
-    acceptor: Option<tokio_rustls::TlsAcceptor>,
+    acceptor: Option<TlsAcceptorType>,
     auth: Option<(String, String)>,
 ) -> Result<()> {
     loop {
@@ -338,8 +349,6 @@ fn build_tls_acceptor(cert_path: &str, key_path: &str) -> Result<tokio_rustls::T
 }
 
 async fn udp_relay(mut udp_socket: tokio::net::UdpSocket) -> Result<()> {
-    use tokio::net::UdpSocket;
-
     // track client peer address (where to send replies)
     let mut client_peer: Option<std::net::SocketAddr> = None;
     let mut buf = vec![0u8; 65536];
@@ -418,22 +427,20 @@ async fn udp_relay(mut udp_socket: tokio::net::UdpSocket) -> Result<()> {
         let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
         let _ = sock.send_to(data, dest).await;
         let mut resp_buf = [0u8; 65536];
-        if let Ok((rn, _)) = tokio::time::timeout(std::time::Duration::from_millis(300), sock.recv_from(&mut resp_buf)).await {
-            if let Ok((rn, _)) = rn {
-                if let Some(client_addr) = client_peer {
-                    // wrap response with UDP header
-                    let mut packet = vec![0u8, 0u8, 0u8, 0x01];
-                    if let std::net::SocketAddr::V4(sa) = dest {
-                        packet.extend_from_slice(&sa.ip().octets());
-                        packet.extend_from_slice(&sa.port().to_be_bytes());
-                    } else if let std::net::SocketAddr::V6(sa) = dest {
-                        packet[3] = 0x04;
-                        packet.extend_from_slice(&sa.ip().octets());
-                        packet.extend_from_slice(&sa.port().to_be_bytes());
-                    }
-                    packet.extend_from_slice(&resp_buf[..rn]);
-                    let _ = udp_socket.send_to(&packet, client_addr).await;
+        if let Ok(Ok((rn, _src))) = tokio::time::timeout(std::time::Duration::from_millis(300), sock.recv_from(&mut resp_buf)).await {
+            if let Some(client_addr) = client_peer {
+                // wrap response with UDP header
+                let mut packet = vec![0u8, 0u8, 0u8, 0x01];
+                if let std::net::SocketAddr::V4(sa) = dest {
+                    packet.extend_from_slice(&sa.ip().octets());
+                    packet.extend_from_slice(&sa.port().to_be_bytes());
+                } else if let std::net::SocketAddr::V6(sa) = dest {
+                    packet[3] = 0x04;
+                    packet.extend_from_slice(&sa.ip().octets());
+                    packet.extend_from_slice(&sa.port().to_be_bytes());
                 }
+                packet.extend_from_slice(&resp_buf[..rn]);
+                let _ = udp_socket.send_to(&packet, client_addr).await;
             }
         }
     }

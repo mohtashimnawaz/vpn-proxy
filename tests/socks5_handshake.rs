@@ -1,4 +1,5 @@
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
 async fn test_no_auth_handshake() {
