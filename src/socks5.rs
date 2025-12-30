@@ -7,7 +7,31 @@ use tracing::{debug, info, warn};
 /// Run the SOCKS5 proxy. If `tls` is Some((cert_path, key_path)) the proxy will accept
 /// TLS on the client side (client -> proxy TLS) using rustls. TLS support is feature-gated
 /// behind the `tls` Cargo feature.
-pub async fn run(listen: &str, tls: Option<(String, String)>) -> Result<()> {
+pub async fn run(listen: &str, tls: Option<(String, String)>, auth: Option<(String, String)>) -> Result<()> {
+    if tls.is_some() && !cfg!(feature = "tls") {
+        return Err(anyhow!("compiled without TLS support; rebuild with `--features tls`"));
+    }
+
+    #[cfg(feature = "tls")]
+    let acceptor = if let Some((cert_path, key_path)) = tls {
+        Some(build_tls_acceptor(&cert_path, &key_path)?)
+    } else {
+        None
+    };
+
+    // For normal run, bind and run accept loop
+    let listener = TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("failed to bind to {}", listen))?;
+
+    info!(%listen, "SOCKS5 proxy listening");
+
+    accept_loop(listener, acceptor, auth).await
+}
+
+/// Start the server in background and return the bound socket address and JoinHandle.
+/// Useful for tests.
+pub async fn start_background(listen: &str, tls: Option<(String, String)>, auth: Option<(String, String)>) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
     if tls.is_some() && !cfg!(feature = "tls") {
         return Err(anyhow!("compiled without TLS support; rebuild with `--features tls`"));
     }
@@ -23,13 +47,29 @@ pub async fn run(listen: &str, tls: Option<(String, String)>) -> Result<()> {
         .await
         .with_context(|| format!("failed to bind to {}", listen))?;
 
-    info!(%listen, "SOCKS5 proxy listening");
+    let addr = listener.local_addr()?;
+    let handle = tokio::spawn(async move {
+        if let Err(e) = accept_loop(listener, acceptor, auth).await {
+            tracing::warn!(error = %e, "accept loop terminated");
+        }
+    });
 
+    Ok((addr, handle))
+}
+
+async fn accept_loop(
+    listener: TcpListener,
+    #[allow(unused_variables)]
+    acceptor: Option<tokio_rustls::TlsAcceptor>,
+    auth: Option<(String, String)>,
+) -> Result<()> {
     loop {
         let (socket, peer) = listener.accept().await?;
         info!(%peer, "accepted connection");
         #[cfg(feature = "tls")]
         let acceptor = acceptor.clone();
+
+        let auth = auth.clone();
 
         tokio::spawn(async move {
             let res = async {
@@ -38,21 +78,20 @@ pub async fn run(listen: &str, tls: Option<(String, String)>) -> Result<()> {
                     if let Some(acceptor) = acceptor {
                         // perform TLS handshake
                         match acceptor.accept(socket).await {
-                            Ok(stream) => handle_client(stream).await,
+                            Ok(stream) => handle_client(stream, auth).await,
                             Err(e) => {
                                 warn!(%peer, error = %e, "tls handshake failed");
                                 Err(anyhow!("tls handshake failed: {}", e))
                             }
                         }
                     } else {
-                        handle_client(socket).await
+                        handle_client(socket, auth).await
                     }
                 }
                 #[cfg(not(feature = "tls"))]
                 {
                     // tls feature not enabled
-                    let _ = peer; // silence unused
-                    handle_client(socket).await
+                    handle_client(socket, auth).await
                 }
             }
             .await;
@@ -64,7 +103,7 @@ pub async fn run(listen: &str, tls: Option<(String, String)>) -> Result<()> {
     }
 }
 
-async fn handle_client<S>(mut socket: S) -> Result<()>
+async fn handle_client<S>(mut socket: S, auth: Option<(String, String)>) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -80,11 +119,50 @@ where
 
     debug!(?methods, "methods from client");
 
-    // we only support NO AUTH (0x00)
-    let method = if methods.iter().any(|m| *m == 0x00) { 0x00 } else { 0xff };
+    // pick method: if auth is configured and client supports user/pass (0x02) use it,
+    // otherwise if client supports NO AUTH (0x00) use that.
+    let method = if auth.is_some() && methods.iter().any(|m| *m == 0x02) {
+        0x02
+    } else if methods.iter().any(|m| *m == 0x00) {
+        0x00
+    } else {
+        0xff
+    };
+
     socket.write_all(&[0x05, method]).await?;
     if method == 0xff {
         return Err(anyhow!("no acceptable auth methods"));
+    }
+
+    // If username/password required, perform subnegotiation (RFC 1929)
+    if method == 0x02 {
+        // version
+        let v = socket.read_u8().await?;
+        if v != 0x01 {
+            // auth version must be 1
+            socket.write_all(&[0x01, 0x01]).await?;
+            return Err(anyhow!("invalid auth version: {}", v));
+        }
+        let ulen = socket.read_u8().await? as usize;
+        let mut ubuf = vec![0u8; ulen];
+        socket.read_exact(&mut ubuf).await?;
+        let plen = socket.read_u8().await? as usize;
+        let mut pbuf = vec![0u8; plen];
+        socket.read_exact(&mut pbuf).await?;
+        let uname = String::from_utf8(ubuf).map_err(|e| anyhow!(e))?;
+        let pwd = String::from_utf8(pbuf).map_err(|e| anyhow!(e))?;
+
+        if let Some((ref u, ref p)) = auth {
+            if &uname == u && &pwd == p {
+                socket.write_all(&[0x01, 0x00]).await?; // success
+            } else {
+                socket.write_all(&[0x01, 0x01]).await?; // failure
+                return Err(anyhow!("authentication failed"));
+            }
+        } else {
+            socket.write_all(&[0x01, 0x01]).await?; // no auth configured -> failure
+            return Err(anyhow!("authentication required but not configured"));
+        }
     }
 
     // 2) Request
@@ -96,6 +174,49 @@ where
     let cmd = socket.read_u8().await?;
     let _rsv = socket.read_u8().await?;
     let atyp = socket.read_u8().await?;
+
+    // If UDP ASSOCIATE (0x03) we need to create a UDP relay socket and return its
+    // address as the bound address in the reply.
+    if cmd == 0x03 {
+        // Currently support IPv4/IPv6/domain for client's supplied DST (ignored by us)
+        // Create UDP socket and spawn relay task
+        let udp_socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+        let local_addr = udp_socket.local_addr()?;
+
+        // reply success with BND.ADDR = local_addr
+        match local_addr {
+            std::net::SocketAddr::V4(sa) => {
+                let ip = sa.ip().octets();
+                let port = sa.port().to_be_bytes();
+                let mut resp = vec![0x05u8, 0x00, 0x00, 0x01];
+                resp.extend_from_slice(&ip);
+                resp.extend_from_slice(&port);
+                socket.write_all(&resp).await?;
+            }
+            std::net::SocketAddr::V6(sa) => {
+                let ip = sa.ip().octets();
+                let port = sa.port().to_be_bytes();
+                let mut resp = vec![0x05u8, 0x00, 0x00, 0x04];
+                resp.extend_from_slice(&ip);
+                resp.extend_from_slice(&port);
+                socket.write_all(&resp).await?;
+            }
+        }
+
+        // Spawn UDP relay task. It will forward between client UDP peer and remote destinations
+        tokio::spawn(async move {
+            if let Err(e) = udp_relay(udp_socket).await {
+                tracing::warn!(error = %e, "udp relay failed");
+            }
+        });
+
+        // Keep TCP connection open until client closes it
+        let mut buf = [0u8; 1];
+        // Read until EOF or error - basically keep the TCP connection alive
+        let _ = socket.read(&mut buf).await;
+
+        return Ok(());
+    }
 
     let dest = match atyp {
         0x01 => {
@@ -214,6 +335,108 @@ fn build_tls_acceptor(cert_path: &str, key_path: &str) -> Result<tokio_rustls::T
         .map_err(|e| anyhow!("failed to build ServerConfig: {}", e))?;
 
     Ok(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config)))
+}
+
+async fn udp_relay(mut udp_socket: tokio::net::UdpSocket) -> Result<()> {
+    use tokio::net::UdpSocket;
+
+    // track client peer address (where to send replies)
+    let mut client_peer: Option<std::net::SocketAddr> = None;
+    let mut buf = vec![0u8; 65536];
+
+    loop {
+        let (n, src) = udp_socket.recv_from(&mut buf).await?;
+        // Expected packet format: RSV(2) FRAG(1) ATYP(1) DST.ADDR DST.PORT DATA
+        if n < 4 {
+            continue;
+        }
+        client_peer.get_or_insert(src);
+
+        let rsv = &buf[0..2];
+        let _frag = buf[2];
+        let atyp = buf[3];
+
+        if rsv != [0, 0] {
+            continue;
+        }
+
+        let mut idx = 4;
+        let dest = match atyp {
+            0x01 => {
+                if n < idx + 4 + 2 {
+                    continue;
+                }
+                let ip = std::net::Ipv4Addr::new(buf[idx], buf[idx + 1], buf[idx + 2], buf[idx + 3]);
+                idx += 4;
+                let port = u16::from_be_bytes([buf[idx], buf[idx + 1]]);
+                idx += 2;
+                std::net::SocketAddr::new(std::net::IpAddr::V4(ip), port)
+            }
+            0x03 => {
+                let len = buf[idx] as usize;
+                idx += 1;
+                if n < idx + len + 2 {
+                    continue;
+                }
+                let host = match std::str::from_utf8(&buf[idx..idx + len]) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => continue,
+                };
+                idx += len;
+                let port = u16::from_be_bytes([buf[idx], buf[idx + 1]]);
+                idx += 2;
+                // resolve
+                match tokio::net::lookup_host((host.as_str(), port)).await {
+                    Ok(mut addrs) => match addrs.next() {
+                        Some(a) => a,
+                        None => continue,
+                    },
+                    Err(_) => continue,
+                }
+            }
+            0x04 => {
+                if n < idx + 16 + 2 {
+                    continue;
+                }
+                let mut ip = [0u8; 16];
+                ip.copy_from_slice(&buf[idx..idx + 16]);
+                idx += 16;
+                let port = u16::from_be_bytes([buf[idx], buf[idx + 1]]);
+                idx += 2;
+                std::net::SocketAddr::new(std::net::IpAddr::from(ip), port)
+            }
+            _ => continue,
+        };
+
+        let data = &buf[idx..n];
+
+        // send to dest
+        let _ = udp_socket.send_to(data, dest).await;
+
+        // try to read response from dest and send back to client
+        // We create a temporary socket to receive the response with a small timeout
+        let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+        let _ = sock.send_to(data, dest).await;
+        let mut resp_buf = [0u8; 65536];
+        if let Ok((rn, _)) = tokio::time::timeout(std::time::Duration::from_millis(300), sock.recv_from(&mut resp_buf)).await {
+            if let Ok((rn, _)) = rn {
+                if let Some(client_addr) = client_peer {
+                    // wrap response with UDP header
+                    let mut packet = vec![0u8, 0u8, 0u8, 0x01];
+                    if let std::net::SocketAddr::V4(sa) = dest {
+                        packet.extend_from_slice(&sa.ip().octets());
+                        packet.extend_from_slice(&sa.port().to_be_bytes());
+                    } else if let std::net::SocketAddr::V6(sa) = dest {
+                        packet[3] = 0x04;
+                        packet.extend_from_slice(&sa.ip().octets());
+                        packet.extend_from_slice(&sa.port().to_be_bytes());
+                    }
+                    packet.extend_from_slice(&resp_buf[..rn]);
+                    let _ = udp_socket.send_to(&packet, client_addr).await;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

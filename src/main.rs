@@ -21,6 +21,14 @@ struct Opts {
     /// TLS private key (PEM) path (required with --tls)
     #[arg(long, requires = "tls")]
     key: Option<String>,
+
+    /// Username to require for username/password authentication (RFC 1929)
+    #[arg(long, requires = "password")]
+    username: Option<String>,
+
+    /// Password to require for username/password authentication (RFC 1929)
+    #[arg(long, requires = "username")]
+    password: Option<String>,
 }
 
 #[tokio::main]
@@ -37,7 +45,13 @@ async fn main() -> Result<()> {
         None
     };
 
-    socks5::run(&opts.listen, tls).await?;
+    let auth = if let (Some(u), Some(p)) = (opts.username, opts.password) {
+        Some((u, p))
+    } else {
+        None
+    };
+
+    socks5::run(&opts.listen, tls, auth).await?;
 
     Ok(())
 }
