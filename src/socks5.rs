@@ -197,7 +197,12 @@ where
         // reply success with BND.ADDR = local_addr
         match local_addr {
             std::net::SocketAddr::V4(sa) => {
-                let ip = sa.ip().octets();
+                // If bound to 0.0.0.0, return loopback so client can reach it
+                let ip = if sa.ip().octets() == [0, 0, 0, 0] {
+                    [127, 0, 0, 1]
+                } else {
+                    sa.ip().octets()
+                };
                 let port = sa.port().to_be_bytes();
                 let mut resp = vec![0x05u8, 0x00, 0x00, 0x01];
                 resp.extend_from_slice(&ip);
