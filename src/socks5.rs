@@ -114,6 +114,10 @@ async fn handle_client(mut socket: TcpStream) -> Result<()> {
                     warn!(error = %e, "proxy IO error");
                 }
             }
+
+            // Ensure sockets are shutdown cleanly
+            let _ = wi.shutdown().await;
+            let _ = wo.shutdown().await;
         }
         Err(e) => {
             warn!(error = %e, %dest, "failed to connect to destination");
