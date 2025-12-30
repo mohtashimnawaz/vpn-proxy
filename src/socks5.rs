@@ -353,99 +353,153 @@ fn build_tls_acceptor(cert_path: &str, key_path: &str) -> Result<tokio_rustls::T
     Ok(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config)))
 }
 
-async fn udp_relay(mut udp_socket: tokio::net::UdpSocket) -> Result<()> {
-    // track client peer address (where to send replies)
-    let mut client_peer: Option<std::net::SocketAddr> = None;
+async fn udp_relay(udp_socket: tokio::net::UdpSocket) -> Result<()> {
+    use std::collections::{BTreeMap, HashMap};
+    use std::time::{Duration, Instant};
+
+    // Map remote destination -> client address (NAT mapping)
+    let mut remote_to_client: HashMap<std::net::SocketAddr, std::net::SocketAddr> = HashMap::new();
+    // Reassembly buffer keyed by (client, dest)
+    type FragMap = BTreeMap<u8, Vec<u8>>;
+    struct Assembly {
+        frags: FragMap,
+        last_seen: Instant,
+    }
+
+    let mut assemblies: HashMap<(std::net::SocketAddr, std::net::SocketAddr), Assembly> = HashMap::new();
+
     let mut buf = vec![0u8; 65536];
+    let cleanup_interval = Duration::from_secs(5);
+    let assembly_ttl = Duration::from_secs(30);
+    let mut last_cleanup = Instant::now();
 
     loop {
+        // Periodic cleanup of stale assemblies
+        if last_cleanup.elapsed() > cleanup_interval {
+            let now = Instant::now();
+            assemblies.retain(|_, a| now.duration_since(a.last_seen) < assembly_ttl);
+            // expire remote mappings that are stale as well (we'll reuse assemblies' timestamps as heuristic)
+            // (For simplicity we don't timestamp remote_to_client separately here.)
+            last_cleanup = now;
+        }
+
         let (n, src) = udp_socket.recv_from(&mut buf).await?;
-        // Expected packet format: RSV(2) FRAG(1) ATYP(1) DST.ADDR DST.PORT DATA
-        if n < 4 {
-            continue;
-        }
-        client_peer.get_or_insert(src);
 
-        let rsv = &buf[0..2];
-        let _frag = buf[2];
-        let atyp = buf[3];
+        // Distinguish packets coming from clients (they will contain SOCKS5 UDP header RSV(2)=0x0000)
+        // vs packets coming from remote destinations (no SOCKS5 header)
+        if n >= 4 && &buf[0..2] == [0u8, 0u8] {
+            // client -> proxy
+            let frag = buf[2];
+            let atyp = buf[3];
 
-        if rsv != [0, 0] {
-            continue;
-        }
+            let mut idx = 4usize;
+            let dest = match atyp {
+                0x01 => {
+                    if n < idx + 4 + 2 {
+                        continue;
+                    }
+                    let ip = std::net::Ipv4Addr::new(buf[idx], buf[idx + 1], buf[idx + 2], buf[idx + 3]);
+                    idx += 4;
+                    let port = u16::from_be_bytes([buf[idx], buf[idx + 1]]);
+                    idx += 2;
+                    std::net::SocketAddr::new(std::net::IpAddr::V4(ip), port)
+                }
+                0x03 => {
+                    let len = buf[idx] as usize;
+                    idx += 1;
+                    if n < idx + len + 2 {
+                        continue;
+                    }
+                    let host = match std::str::from_utf8(&buf[idx..idx + len]) {
+                        Ok(s) => s.to_string(),
+                        Err(_) => continue,
+                    };
+                    idx += len;
+                    let port = u16::from_be_bytes([buf[idx], buf[idx + 1]]);
+                    idx += 2;
+                    match tokio::net::lookup_host((host.as_str(), port)).await {
+                        Ok(mut addrs) => match addrs.next() {
+                            Some(a) => a,
+                            None => continue,
+                        },
+                        Err(_) => continue,
+                    }
+                }
+                0x04 => {
+                    if n < idx + 16 + 2 {
+                        continue;
+                    }
+                    let mut ip = [0u8; 16];
+                    ip.copy_from_slice(&buf[idx..idx + 16]);
+                    idx += 16;
+                    let port = u16::from_be_bytes([buf[idx], buf[idx + 1]]);
+                    idx += 2;
+                    std::net::SocketAddr::new(std::net::IpAddr::from(ip), port)
+                }
+                _ => continue,
+            };
 
-        let mut idx = 4;
-        let dest = match atyp {
-            0x01 => {
-                if n < idx + 4 + 2 {
+            let payload = buf[idx..n].to_vec();
+
+            // If fragmented (frag != 0), buffer fragments keyed by (client, dest)
+            let key = (src, dest);
+            if frag != 0 {
+                let entry = assemblies.entry(key).or_insert(Assembly {
+                    frags: BTreeMap::new(),
+                    last_seen: Instant::now(),
+                });
+                if entry.frags.len() > 128 {
+                    // avoid OOM - drop
                     continue;
                 }
-                let ip = std::net::Ipv4Addr::new(buf[idx], buf[idx + 1], buf[idx + 2], buf[idx + 3]);
-                idx += 4;
-                let port = u16::from_be_bytes([buf[idx], buf[idx + 1]]);
-                idx += 2;
-                std::net::SocketAddr::new(std::net::IpAddr::V4(ip), port)
-            }
-            0x03 => {
-                let len = buf[idx] as usize;
-                idx += 1;
-                if n < idx + len + 2 {
+                entry.frags.insert(frag, payload);
+                entry.last_seen = Instant::now();
+                // We consider frag==0 as the final fragment marker; if we already have frag==0 in place and all lower frags, assemble
+                if entry.frags.get(&0).is_some() {
+                    // assemble in order of keys ascending
+                    let mut assembled = Vec::new();
+                    for (_k, v) in entry.frags.iter() {
+                        assembled.extend_from_slice(v);
+                    }
+                    assemblies.remove(&key);
+                    // send assembled to dest and remember mapping
+                    let _ = udp_socket.send_to(&assembled, dest).await;
+                    remote_to_client.insert(dest, src);
+                }
+                continue;
+            } else {
+                // frag == 0
+                if let Some(entry) = assemblies.remove(&key) {
+                    // combine all fragments plus this last payload
+                    let mut assembled = Vec::new();
+                    for (_k, v) in entry.frags.iter() {
+                        assembled.extend_from_slice(v);
+                    }
+                    assembled.extend_from_slice(&payload);
+                    let _ = udp_socket.send_to(&assembled, dest).await;
+                    remote_to_client.insert(dest, src);
                     continue;
                 }
-                let host = match std::str::from_utf8(&buf[idx..idx + len]) {
-                    Ok(s) => s.to_string(),
-                    Err(_) => continue,
-                };
-                idx += len;
-                let port = u16::from_be_bytes([buf[idx], buf[idx + 1]]);
-                idx += 2;
-                // resolve
-                match tokio::net::lookup_host((host.as_str(), port)).await {
-                    Ok(mut addrs) => match addrs.next() {
-                        Some(a) => a,
-                        None => continue,
-                    },
-                    Err(_) => continue,
-                }
+                // not fragmented, send directly
+                let _ = udp_socket.send_to(&payload, dest).await;
+                remote_to_client.insert(dest, src);
             }
-            0x04 => {
-                if n < idx + 16 + 2 {
-                    continue;
-                }
-                let mut ip = [0u8; 16];
-                ip.copy_from_slice(&buf[idx..idx + 16]);
-                idx += 16;
-                let port = u16::from_be_bytes([buf[idx], buf[idx + 1]]);
-                idx += 2;
-                std::net::SocketAddr::new(std::net::IpAddr::from(ip), port)
-            }
-            _ => continue,
-        };
-
-        let data = &buf[idx..n];
-
-        // send to dest
-        let _ = udp_socket.send_to(data, dest).await;
-
-        // try to read response from dest and send back to client
-        // We create a temporary socket to receive the response with a small timeout
-        let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
-        let _ = sock.send_to(data, dest).await;
-        let mut resp_buf = [0u8; 65536];
-        if let Ok(Ok((rn, _src))) = tokio::time::timeout(std::time::Duration::from_millis(300), sock.recv_from(&mut resp_buf)).await {
-            if let Some(client_addr) = client_peer {
-                // wrap response with UDP header
+        } else {
+            // packet from remote destination -> forward to client if we have mapping
+            let src_addr = src;
+            if let Some(client_addr) = remote_to_client.get(&src_addr) {
+                // wrap with SOCKS5 UDP header
                 let mut packet = vec![0u8, 0u8, 0u8, 0x01];
-                if let std::net::SocketAddr::V4(sa) = dest {
+                if let std::net::SocketAddr::V4(sa) = src_addr {
                     packet.extend_from_slice(&sa.ip().octets());
                     packet.extend_from_slice(&sa.port().to_be_bytes());
-                } else if let std::net::SocketAddr::V6(sa) = dest {
+                } else if let std::net::SocketAddr::V6(sa) = src_addr {
                     packet[3] = 0x04;
                     packet.extend_from_slice(&sa.ip().octets());
                     packet.extend_from_slice(&sa.port().to_be_bytes());
                 }
-                packet.extend_from_slice(&resp_buf[..rn]);
-                let _ = udp_socket.send_to(&packet, client_addr).await;
+                packet.extend_from_slice(&buf[..n]);
+                let _ = udp_socket.send_to(&packet, *client_addr).await;
             }
         }
     }

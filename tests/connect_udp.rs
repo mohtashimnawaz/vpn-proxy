@@ -149,6 +149,26 @@ async fn test_udp_associate_end_to_end() {
         // skip to data
         let data_idx = 4 + 4 + 2; // IPv4 addr + port
         assert_eq!(&buf[data_idx..n], b"hello udp");
+
+        // Now test fragmentation: send first fragment (frag=1), then final fragment (frag=0)
+        let payload1 = b"hello ";
+        let payload2 = b"udp frag";
+        let mut frag1 = vec![0u8, 0u8, 0x01u8, 0x01u8];
+        frag1.extend_from_slice(&echo_v4.ip().octets());
+        frag1.extend_from_slice(&echo_v4.port().to_be_bytes());
+        frag1.extend_from_slice(payload1);
+        udp_client.send_to(&frag1, udp_proxy_addr).await.expect("send frag1");
+
+        let mut frag2 = vec![0u8, 0u8, 0x00u8, 0x01u8];
+        frag2.extend_from_slice(&echo_v4.ip().octets());
+        frag2.extend_from_slice(&echo_v4.port().to_be_bytes());
+        frag2.extend_from_slice(payload2);
+        udp_client.send_to(&frag2, udp_proxy_addr).await.expect("send frag2");
+
+        let (n, _src) = tokio::time::timeout(Duration::from_secs(1), udp_client.recv_from(&mut buf)).await.expect("recv timeout").expect("recv");
+        // check payload
+        let data_idx = 4 + 4 + 2;
+        assert_eq!(&buf[data_idx..n], b"hello udp frag");
     } else {
         panic!("unexpected echo addr family");
     }
