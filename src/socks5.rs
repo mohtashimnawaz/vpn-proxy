@@ -1,10 +1,24 @@
 use anyhow::{anyhow, Context, Result};
 use std::net::{Ipv4Addr, SocketAddr};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
-pub async fn run(listen: &str) -> Result<()> {
+/// Run the SOCKS5 proxy. If `tls` is Some((cert_path, key_path)) the proxy will accept
+/// TLS on the client side (client -> proxy TLS) using rustls. TLS support is feature-gated
+/// behind the `tls` Cargo feature.
+pub async fn run(listen: &str, tls: Option<(String, String)>) -> Result<()> {
+    if tls.is_some() && !cfg!(feature = "tls") {
+        return Err(anyhow!("compiled without TLS support; rebuild with `--features tls`"));
+    }
+
+    #[cfg(feature = "tls")]
+    let acceptor = if let Some((cert_path, key_path)) = tls {
+        Some(build_tls_acceptor(&cert_path, &key_path)?)
+    } else {
+        None
+    };
+
     let listener = TcpListener::bind(listen)
         .await
         .with_context(|| format!("failed to bind to {}", listen))?;
@@ -14,15 +28,46 @@ pub async fn run(listen: &str) -> Result<()> {
     loop {
         let (socket, peer) = listener.accept().await?;
         info!(%peer, "accepted connection");
+        #[cfg(feature = "tls")]
+        let acceptor = acceptor.clone();
+
         tokio::spawn(async move {
-            if let Err(e) = handle_client(socket).await {
+            let res = async {
+                #[cfg(feature = "tls")]
+                {
+                    if let Some(acceptor) = acceptor {
+                        // perform TLS handshake
+                        match acceptor.accept(socket).await {
+                            Ok(stream) => handle_client(stream).await,
+                            Err(e) => {
+                                warn!(%peer, error = %e, "tls handshake failed");
+                                Err(anyhow!("tls handshake failed: {}", e))
+                            }
+                        }
+                    } else {
+                        handle_client(socket).await
+                    }
+                }
+                #[cfg(not(feature = "tls"))]
+                {
+                    // tls feature not enabled
+                    let _ = peer; // silence unused
+                    handle_client(socket).await
+                }
+            }
+            .await;
+
+            if let Err(e) = res {
                 warn!(%peer, error = %e, "connection handler error");
             }
         });
     }
 }
 
-async fn handle_client(mut socket: TcpStream) -> Result<()> {
+async fn handle_client<S>(mut socket: S) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     // 1) Negotiation
     let ver = socket.read_u8().await?;
     if ver != 0x05 {
@@ -125,6 +170,50 @@ async fn handle_client(mut socket: TcpStream) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(feature = "tls")]
+fn build_tls_acceptor(cert_path: &str, key_path: &str) -> Result<tokio_rustls::TlsAcceptor> {
+    use rustls::{Certificate, PrivateKey, ServerConfig};
+    use std::fs::File;
+    use std::io::BufReader;
+
+    let certfile = File::open(cert_path).with_context(|| format!("failed to open cert file: {}", cert_path))?;
+    let keyfile = File::open(key_path).with_context(|| format!("failed to open key file: {}", key_path))?;
+    let mut certreader = BufReader::new(certfile);
+    let mut keyreader = BufReader::new(keyfile);
+
+    let certs = rustls_pemfile::certs(&mut certreader)
+        .map_err(|_| anyhow!("failed to parse certs"))?
+        .into_iter()
+        .map(Certificate)
+        .collect::<Vec<_>>();
+
+    // prefer pkcs8, then rsa
+    let mut keys = rustls_pemfile::pkcs8_private_keys(&mut keyreader)
+        .map_err(|_| anyhow!("failed to parse private key"))?;
+
+    if keys.is_empty() {
+        // rewind and try rsa
+        let keyfile = File::open(key_path)?;
+        let mut keyreader = BufReader::new(keyfile);
+        keys = rustls_pemfile::rsa_private_keys(&mut keyreader)
+            .map_err(|_| anyhow!("failed to parse rsa private key"))?;
+    }
+
+    if keys.is_empty() {
+        return Err(anyhow!("no private keys found in {}", key_path));
+    }
+
+    let key = PrivateKey(keys.remove(0));
+
+    let config = ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| anyhow!("failed to build ServerConfig: {}", e))?;
+
+    Ok(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config)))
 }
 
 #[cfg(test)]
