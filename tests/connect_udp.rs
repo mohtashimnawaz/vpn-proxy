@@ -169,6 +169,11 @@ async fn test_udp_associate_end_to_end() {
         // check payload
         let data_idx = 4 + 4 + 2;
         assert_eq!(&buf[data_idx..n], b"hello udp frag");
+
+        // Validate metrics: at least one fragment assembled and fragments received
+        let metrics = vpn_proxy::socks5::metrics_snapshot();
+        assert!(metrics.get("udp_frag_received").copied().unwrap_or(0) >= 2);
+        assert!(metrics.get("udp_frag_assembled").copied().unwrap_or(0) >= 1);
     } else {
         panic!("unexpected echo addr family");
     }

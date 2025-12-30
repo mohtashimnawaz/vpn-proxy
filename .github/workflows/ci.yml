@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        rust: [stable]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: ${{ matrix.rust }}
+          profile: minimal
+          override: true
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build (default)
+        run: cargo build --verbose
+      - name: Test (default)
+        run: cargo test --verbose
+      - name: Build with TLS feature
+        run: cargo build --features tls --verbose
+      - name: Test with TLS feature
+        run: cargo test --features tls --verbose

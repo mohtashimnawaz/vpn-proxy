@@ -3,6 +3,42 @@ use std::net::{Ipv4Addr, SocketAddr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
+use once_cell::sync::Lazy;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{BTreeMap, HashMap};
+
+// Metrics for UDP events
+#[derive(Default)]
+struct Metrics {
+    udp_frag_received: AtomicU64,
+    udp_frag_assembled: AtomicU64,
+    udp_frag_dropped: AtomicU64,
+    udp_mapping_created: AtomicU64,
+    udp_mapping_expired: AtomicU64,
+}
+
+impl Metrics {
+    fn incr_frag_received(&self) { self.udp_frag_received.fetch_add(1, Ordering::Relaxed); }
+    fn incr_frag_assembled(&self) { self.udp_frag_assembled.fetch_add(1, Ordering::Relaxed); }
+    fn incr_frag_dropped(&self) { self.udp_frag_dropped.fetch_add(1, Ordering::Relaxed); }
+    fn incr_mapping_created(&self) { self.udp_mapping_created.fetch_add(1, Ordering::Relaxed); }
+    fn incr_mapping_expired(&self) { self.udp_mapping_expired.fetch_add(1, Ordering::Relaxed); }
+    fn snapshot(&self) -> HashMap<&'static str, u64> {
+        let mut m = HashMap::new();
+        m.insert("udp_frag_received", self.udp_frag_received.load(Ordering::Relaxed));
+        m.insert("udp_frag_assembled", self.udp_frag_assembled.load(Ordering::Relaxed));
+        m.insert("udp_frag_dropped", self.udp_frag_dropped.load(Ordering::Relaxed));
+        m.insert("udp_mapping_created", self.udp_mapping_created.load(Ordering::Relaxed));
+        m.insert("udp_mapping_expired", self.udp_mapping_expired.load(Ordering::Relaxed));
+        m
+    }
+}
+
+static METRICS: Lazy<Metrics> = Lazy::new(Metrics::default);
+
+pub fn metrics_snapshot() -> HashMap<&'static str, u64> {
+    METRICS.snapshot()
+}
 
 #[cfg(feature = "tls")]
 type TlsAcceptorType = tokio_rustls::TlsAcceptor;
@@ -357,20 +393,25 @@ async fn udp_relay(udp_socket: tokio::net::UdpSocket) -> Result<()> {
     use std::collections::{BTreeMap, HashMap};
     use std::time::{Duration, Instant};
 
-    // Map remote destination -> client address (NAT mapping)
-    let mut remote_to_client: HashMap<std::net::SocketAddr, std::net::SocketAddr> = HashMap::new();
+    // Map remote destination -> (client address, created_at)
+    let mut remote_to_client: HashMap<std::net::SocketAddr, (std::net::SocketAddr, Instant)> = HashMap::new();
     // Reassembly buffer keyed by (client, dest)
     type FragMap = BTreeMap<u8, Vec<u8>>;
     struct Assembly {
         frags: FragMap,
+        total_size: usize,
         last_seen: Instant,
     }
 
     let mut assemblies: HashMap<(std::net::SocketAddr, std::net::SocketAddr), Assembly> = HashMap::new();
 
+    // Limits and timings
     let mut buf = vec![0u8; 65536];
     let cleanup_interval = Duration::from_secs(5);
-    let assembly_ttl = Duration::from_secs(30);
+    let assembly_ttl = Duration::from_secs(30); // per-assembly TTL
+    let mapping_ttl = Duration::from_secs(60); // explicit TTL for remote->client mapping
+    const MAX_REASSEMBLY_SIZE: usize = 64 * 1024; // 64KiB
+    const MAX_FRAGMENTS: usize = 256;
     let mut last_cleanup = Instant::now();
 
     loop {
@@ -378,8 +419,15 @@ async fn udp_relay(udp_socket: tokio::net::UdpSocket) -> Result<()> {
         if last_cleanup.elapsed() > cleanup_interval {
             let now = Instant::now();
             assemblies.retain(|_, a| now.duration_since(a.last_seen) < assembly_ttl);
-            // expire remote mappings that are stale as well (we'll reuse assemblies' timestamps as heuristic)
-            // (For simplicity we don't timestamp remote_to_client separately here.)
+            // expire remote mappings that are stale as well
+            let before = remote_to_client.len();
+            remote_to_client.retain(|_k, v| now.duration_since(v.1) < mapping_ttl);
+            let after = remote_to_client.len();
+            if before != after {
+                let expired = (before - after) as u64;
+                for _ in 0..expired { METRICS.incr_mapping_expired(); }
+                info!(expired = expired, "expired UDP mappings due to TTL");
+            }
             last_cleanup = now;
         }
 
@@ -389,6 +437,7 @@ async fn udp_relay(udp_socket: tokio::net::UdpSocket) -> Result<()> {
         // vs packets coming from remote destinations (no SOCKS5 header)
         if n >= 4 && &buf[0..2] == [0u8, 0u8] {
             // client -> proxy
+            METRICS.incr_frag_received();
             let frag = buf[2];
             let atyp = buf[3];
 
@@ -446,30 +495,82 @@ async fn udp_relay(udp_socket: tokio::net::UdpSocket) -> Result<()> {
             if frag != 0 {
                 let entry = assemblies.entry(key).or_insert(Assembly {
                     frags: BTreeMap::new(),
+                    total_size: 0,
                     last_seen: Instant::now(),
                 });
-                if entry.frags.len() > 128 {
-                    // avoid OOM - drop
+
+                // bounds checks
+                if entry.frags.len() >= MAX_FRAGMENTS {
+                    warn!(%src, %dest, "too many fragments, dropping");
+                    METRICS.incr_frag_dropped();
                     continue;
                 }
+                if entry.total_size + payload.len() > MAX_REASSEMBLY_SIZE {
+                    warn!(%src, %dest, "fragment would exceed max reassembly size, dropping assembly");
+                    assemblies.remove(&key);
+                    METRICS.incr_frag_dropped();
+                    continue;
+                }
+
+                entry.total_size += payload.len();
                 entry.frags.insert(frag, payload);
                 entry.last_seen = Instant::now();
-                // We consider frag==0 as the final fragment marker; if we already have frag==0 in place and all lower frags, assemble
+
+                // If a final fragment already exists (frag==0 in map), attempt assembly when all fragments are present
                 if entry.frags.get(&0).is_some() {
-                    // assemble in order of keys ascending
-                    let mut assembled = Vec::new();
-                    for (_k, v) in entry.frags.iter() {
-                        assembled.extend_from_slice(v);
+                    // Check for contiguous fragment indices 1..=max
+                    let max_frag = *entry.frags.keys().max().unwrap_or(&0);
+                    let mut missing = false;
+                    for i in 1..=max_frag {
+                        if !entry.frags.contains_key(&i) {
+                            missing = true;
+                            break;
+                        }
                     }
-                    assemblies.remove(&key);
-                    // send assembled to dest and remember mapping
-                    let _ = udp_socket.send_to(&assembled, dest).await;
-                    remote_to_client.insert(dest, src);
+                    if missing {
+                        // wait for missing fragments until TTL expires
+                        debug!(%src, %dest, "fragments out-of-order / missing, waiting for remainder");
+                    } else {
+                        // assemble
+                        let mut assembled = Vec::new();
+                        for (_k, v) in entry.frags.iter() {
+                            assembled.extend_from_slice(v);
+                        }
+                        assemblies.remove(&key);
+                        let _ = udp_socket.send_to(&assembled, dest).await;
+                        remote_to_client.insert(dest, (src, Instant::now()));
+                        METRICS.incr_frag_assembled();
+                        METRICS.incr_mapping_created();
+                        info!(%src, %dest, "fragments assembled and sent");
+                    }
                 }
+
                 continue;
             } else {
                 // frag == 0
-                if let Some(entry) = assemblies.remove(&key) {
+                if let Some(mut entry) = assemblies.remove(&key) {
+                    // Ensure we have contiguous fragments 1..=max
+                    let max_frag = *entry.frags.keys().max().unwrap_or(&0);
+                    let mut missing = false;
+                    for i in 1..=max_frag {
+                        if !entry.frags.contains_key(&i) {
+                            missing = true;
+                            break;
+                        }
+                    }
+                    if missing {
+                        warn!(%src, %dest, "missing fragments on final fragment, dropping assembly");
+                        METRICS.incr_frag_dropped();
+                        continue;
+                    }
+
+                    // Check size
+                    if entry.total_size + payload.len() > MAX_REASSEMBLY_SIZE {
+                        warn!(%src, %dest, "assembled size exceeds max, dropping");
+                        METRICS.incr_frag_dropped();
+                        continue;
+                    }
+
                     // combine all fragments plus this last payload
                     let mut assembled = Vec::new();
                     for (_k, v) in entry.frags.iter() {
@@ -477,17 +578,24 @@ async fn udp_relay(udp_socket: tokio::net::UdpSocket) -> Result<()> {
                     }
                     assembled.extend_from_slice(&payload);
                     let _ = udp_socket.send_to(&assembled, dest).await;
-                    remote_to_client.insert(dest, src);
+                    remote_to_client.insert(dest, (src, Instant::now()));
+                    METRICS.incr_frag_assembled();
+                    METRICS.incr_mapping_created();
+                    info!(%src, %dest, "fragments assembled on final fragment and sent");
                     continue;
                 }
                 // not fragmented, send directly
                 let _ = udp_socket.send_to(&payload, dest).await;
-                remote_to_client.insert(dest, src);
+                remote_to_client.insert(dest, (src, Instant::now()));
+                METRICS.incr_mapping_created();
             }
         } else {
             // packet from remote destination -> forward to client if we have mapping
             let src_addr = src;
-            if let Some(client_addr) = remote_to_client.get(&src_addr) {
+            // expire old mappings
+            let now = Instant::now();
+            remote_to_client.retain(|_k, v| now.duration_since(v.1) < mapping_ttl);
+            if let Some((client_addr, _)) = remote_to_client.get(&src_addr) {
                 // wrap with SOCKS5 UDP header
                 let mut packet = vec![0u8, 0u8, 0u8, 0x01];
                 if let std::net::SocketAddr::V4(sa) = src_addr {
