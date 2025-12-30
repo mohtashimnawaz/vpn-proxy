@@ -1,0 +1,16 @@
+[package]
+name = "vpn-proxy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
+# Optional TLS support (enable with --features tls)
+rustls = { version = "0.21", optional = true }
+tokio-rustls = { version = "0.24", optional = true }
+ring = { version = "0.16", optional = true }
